@@ -1,0 +1,423 @@
+import chainlit as cl
+from typing import Annotated, Literal, Optional
+from chainlit.input_widget import Select
+from langgraph.graph import StateGraph, END
+from langchain_core.messages import SystemMessage
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables import Runnable, RunnableConfig
+from langgraph.prebuilt import ToolNode
+from pydantic import BaseModel, Field
+
+from langchain_core.messages import ToolMessage
+from langchain_core.runnables import RunnableLambda
+from langgraph.prebuilt import tools_condition
+from typing import Callable
+
+from .base import BaseWorkflow, BaseState
+from ..llm import llm_factory, ModelCapability
+
+from ..tools.multi_agent_test import call_model
+from ..tools.plot import plot_pie_chart
+
+from langchain_community.utilities.sql_database import SQLDatabase
+from langchain_community.tools.sql_database.tool import (
+    InfoSQLDatabaseTool,
+    ListSQLDatabaseTool,
+    QuerySQLDataBaseTool,
+)
+
+from sqlalchemy import create_engine
+
+sys_engine = create_engine("sqlite:////home/kxn/research-onyx-ai/abel/db/eve_sys.sqlite")
+dim_engine = create_engine("sqlite:////home/kxn/research-onyx-ai/abel/db/dim_system.sqlite")
+db_sys = SQLDatabase(sys_engine)
+db_dim = SQLDatabase(dim_engine)
+
+
+def get_sql_toolkit(engine):
+    db = SQLDatabase(engine)
+    return [InfoSQLDatabaseTool(db=db),
+            ListSQLDatabaseTool(db=db),
+            QuerySQLDataBaseTool(db=db)]
+
+
+def handle_tool_error(state) -> dict:
+    error = state.get("error")
+    tool_calls = state["messages"][-1].tool_calls
+    return {
+        "messages": [
+            ToolMessage(
+                content=f"Error: {repr(error)}\n please fix your mistakes.",
+                tool_call_id=tc["id"],
+            )
+            for tc in tool_calls
+        ]
+    }
+
+
+def create_tool_node_with_fallback(tools: list) -> dict:
+    return ToolNode(tools).with_fallbacks(
+        [RunnableLambda(handle_tool_error)], exception_key="error"
+    )
+
+
+def update_dialog_stack(left: list[str], right: Optional[str]) -> list[str]:
+    """Push or pop the state."""
+    if right is None:
+        return left
+    if right == "pop":
+        return left[:-1]
+    return left + [right]
+
+
+class GraphState(BaseState):
+    chat_model: str
+    dialog_state: Annotated[
+        list[
+            Literal[
+                "assistant",
+                "eve_system",
+                "eve_dimension",
+            ]
+        ],
+        update_dialog_stack,
+    ]
+
+
+class CompleteOrEscalate(BaseModel):
+    """A tool to mark the current task as completed and/or to escalate control of the dialog to the main assistant,
+    who can re-route the dialog based on the user's needs."""
+
+    cancel: bool = True
+    reason: str
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "cancel": True,
+                "reason": "User changed their mind about the current task.",
+            },
+            "example 2": {
+                "cancel": True,
+                "reason": "I have fully completed the task.",
+            },
+            "example 3": {
+                "cancel": False,
+                "reason": "I need to search the user's emails or calendar for more information.",
+            },
+        }
+
+
+class ToDBDim(BaseModel):
+    """Transfers work to a specialized assistant to handle Anything about EVE Solar System."""
+
+    location: str = Field(
+        description="The location where the user wants to check the EVE Solar System"
+    )
+    request: str = Field(description="Any addtional  questions about the EVE system.")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "location": "Jita",
+                "request": "What is the description of JIta",
+            }
+        }
+
+
+class ToDBSys(BaseModel):
+    """Transfers work to a specialized assistant to handle Anything about EVE."""
+
+    request: str = Field(description="Any addtional questions about EVE info.")
+
+
+def create_entry_node(assistant_name: str, new_dialog_state: str) -> Callable:
+    def entry_node(state: GraphState) -> dict:
+        tool_call_id = state["messages"][-1].tool_calls[0]["id"]
+        return {
+            "messages": [
+                ToolMessage(
+                    content=f"The assistant is now the {assistant_name}. Reflect on the above conversation between the host assistant and the user."
+                    f" The user's intent is unsatisfied. Use the provided tools to assist the user. If no tool available just switch to primary. Remember, you are {assistant_name},"
+                    " and the booking, update, other other action is not complete until after you have successfully invoked the appropriate tool."
+                    " If the user changes their mind or needs help for other tasks, call the CompleteOrEscalate function to let the primary host assistant take control."
+                    " Do not mention who you are - just act as the proxy for the assistant.",
+                    tool_call_id=tool_call_id,
+                )
+            ],
+            "dialog_state": new_dialog_state,
+        }
+
+    return entry_node
+
+
+class DBChatWorkflow(BaseWorkflow):
+    def __init__(self):
+        super().__init__()
+
+        self.capabilities = {ModelCapability.TEXT_TO_TEXT, ModelCapability.TOOL_CALLING}
+        self.primary_assistant_tools = [
+            call_model,
+            ToDBDim,
+            ToDBSys,
+            plot_pie_chart
+        ]
+        self.db_sys_tools = get_sql_toolkit(sys_engine) + [CompleteOrEscalate]
+        self.db_dim_tools = get_sql_toolkit(dim_engine) + [CompleteOrEscalate]
+
+    def create_graph(self) -> StateGraph:
+        # INJECT Multi Agent Here
+        builder = StateGraph(GraphState)
+        builder.set_entry_point("primary_assistant")
+
+        # DB SYS SubGraphs
+        builder.add_node(
+            "enter_db_sys",
+            create_entry_node("EVE System Assistant", "db_sys"),
+        )
+        builder.add_node("db_sys", self.db_sys)
+        builder.add_edge("enter_db_sys", "db_sys")
+        builder.add_node(
+            "db_sys_tools",
+            create_tool_node_with_fallback(self.db_sys_tools)
+        )
+        builder.add_edge("db_sys_tools", "db_sys")
+        builder.add_conditional_edges(
+            "db_sys",
+            self.route_db_sys,
+            ["db_sys_tools", "leave_skill", END],
+        )
+
+        # DB DIM SubGraphs
+        builder.add_node(
+            "enter_db_dim",
+            create_entry_node("EVE Navigation Assistant", "db_dim"),
+        )
+        builder.add_node("db_dim", self.db_dim)
+        builder.add_edge("enter_db_dim", "db_dim")
+        builder.add_node(
+            "db_dim_tools",
+            create_tool_node_with_fallback(self.db_dim_tools)
+        )
+        builder.add_edge("db_dim_tools", "db_dim")
+        builder.add_conditional_edges(
+            "db_dim",
+            self.route_db_dim,
+            ["db_dim_tools", "leave_skill", END],
+        )
+
+        builder.add_node("leave_skill", self.pop_dialog_state)
+        builder.add_edge("leave_skill", "primary_assistant")
+        builder.add_node("primary_assistant", self.primary_assistant_node)
+        builder.add_node(
+            "primary_assistant_tools",
+            create_tool_node_with_fallback(self.primary_assistant_tools),
+        )
+
+        builder.add_conditional_edges(
+            "primary_assistant",
+            self.route_primary_assistant,
+            [
+                "enter_db_sys",
+                "enter_db_dim",
+                "primary_assistant_tools",
+                END,
+            ],
+        )
+        builder.add_edge("primary_assistant_tools", "primary_assistant")
+        return builder
+
+    async def primary_assistant_node(
+        self, state: GraphState, config: RunnableConfig
+    ) -> GraphState:
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                SystemMessage(
+                    content="""
+                    System: You are a helpful customer support assistant for activity in EVE Online.\n
+                    Your primary role is to guide users about EVE Online.\n
+                    delegate the task to the appropriate specialized assistant by invoking the corresponding tool.\n
+                    You are not able to make these types of changes yourself. Only the specialized assistants are given permission to do this for the user.\n
+                    The user is not aware of the different specialized assistants, so do not mention them; just quietly delegate through function calls.\n
+                    When searching, be persistent. Expand your query bounds if the first search returns no results.\n
+                    If a search comes up empty, expand your search before giving up.
+
+                    If possible, if querrying DataBase, return in a format of markdown to be compact
+                """
+                ),
+                MessagesPlaceholder(variable_name="messages"),
+            ]
+        )
+
+        llm = llm_factory.create_model(
+            self.output_chat_model,
+            model=state["chat_model"],
+            tools=self.primary_assistant_tools,
+        )
+
+        chain: Runnable = prompt | llm
+        return {"messages": [await chain.ainvoke(state, config=config)]}
+
+    async def db_sys(self, state: GraphState, config: RunnableConfig) -> GraphState:
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                SystemMessage(
+                    content="""
+                    System: You are a specialized assistant for handling *EVE Online* system-wide information.\n
+                    You provide detailed insights about ships, modules, blueprints, industry, factions, corporations, market trends,
+                    and game mechanics. You assist players in understanding ship fittings, PvP tactics, manufacturing,
+                    trading strategies, and sovereignty mechanics.\n
+                    When providing market or industry advice, ensure accuracy by referencing regional trade hubs such as Jita,
+                    Amarr, Dodixie, Rens, or Hek.\n
+                    If a user request falls outside your knowledge or requires in-game action, escalate it to the main assistant
+                    or direct them to appropriate third-party tools like zKillboard, EVE Marketer, or Dotlan Maps.\n
+                    Never fabricate information about game mechanics or in-game prices.
+
+                    If possible, if querrying DataBase, return in a format of markdown to be compact
+                    """
+                ),
+                MessagesPlaceholder(variable_name="messages"),
+            ]
+        )
+
+        llm = llm_factory.create_model(
+            self.output_chat_model,
+            model=state["chat_model"],
+            tools=self.db_sys_tools,
+        )
+        chain: Runnable = prompt | llm
+        return {"messages": [await chain.ainvoke(state, config=config)]}
+
+    async def db_dim(self, state: GraphState, config: RunnableConfig) -> GraphState:
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                SystemMessage(
+                    content="""
+                    System: You are a specialized assistant for handling *EVE Online* navigation and route planning.\n
+                    You provide information on stargates, jump routes, wormholes, and system security levels (Highsec, Lowsec, Nullsec, and Wormhole space).\n
+                    Assist players in planning the safest or fastest route between two systems, considering security status, gate camps, and wormhole shortcuts.\n
+                    Always provide options for manual navigation and jump drive logistics where applicable. For long-haul logistics or capital ship movement,
+                    suggest using Jump Freighters, Cynosural Networks, or Ansiblex Jump Gates.\n
+                    If a requested route is dangerous (e.g., through high-traffic PvP zones), provide alternative paths and safety precautions.\n
+                    Direct players to third-party navigation tools like Dotlan or in-game autopilot when necessary.
+                    """
+                ),
+                MessagesPlaceholder(variable_name="messages"),
+            ]
+        )
+
+        llm = llm_factory.create_model(
+            self.output_chat_model,
+            model=state["chat_model"],
+            tools=self.db_dim_tools,
+        )
+        chain: Runnable = prompt | llm
+        return {"messages": [await chain.ainvoke(state, config=config)]}
+
+    def pop_dialog_state(self, state: GraphState) -> dict:
+        """Pop the dialog stack and return to the main assistant.
+
+        This lets the full graph explicitly track the dialog flow and delegate control
+        to specific sub-graphs.
+        """
+        messages = []
+        if state["messages"][-1].tool_calls:
+            # Note: Doesn't currently handle the edge case where the llm performs parallel tool calls
+            messages.append(
+                ToolMessage(
+                    content="Resuming dialog with the host assistant. Please reflect on the past conversation and assist the user as needed.",
+                    tool_call_id=state["messages"][-1].tool_calls[0]["id"],
+                )
+            )
+        return {
+            "dialog_state": "pop",
+            "messages": messages,
+        }
+
+    def route_primary_assistant(
+        self,
+        state: GraphState,
+    ):
+        route = tools_condition(state)
+        if route == END:
+            return END
+        tool_calls = state["messages"][-1].tool_calls
+        if tool_calls:
+            if tool_calls[0]["name"] == ToDBSys.__name__:
+                return "enter_db_sys"
+            elif tool_calls[0]["name"] == ToDBDim.__name__:
+                return "enter_db_dim"
+            return "primary_assistant_tools"
+        raise ValueError("Invalid route")
+
+    def route_db_sys(
+        self,
+        state: GraphState,
+    ):
+        route = tools_condition(state)
+        if route == END:
+            return END
+        tool_calls = state["messages"][-1].tool_calls
+        did_cancel = any(tc["name"] == CompleteOrEscalate.__name__ for tc in tool_calls)
+        if did_cancel:
+            return "leave_skill"
+        return "db_sys_tools"
+
+    def route_db_dim(
+        self,
+        state: GraphState,
+    ):
+        route = tools_condition(state)
+        if route == END:
+            return END
+        tool_calls = state["messages"][-1].tool_calls
+        did_cancel = any(tc["name"] == CompleteOrEscalate.__name__ for tc in tool_calls)
+        if did_cancel:
+            return "leave_skill"
+        return "db_dim_tools"
+
+    def create_default_state(self) -> GraphState:
+        return {
+            "name": self.name(),
+            "messages": [],
+            "chat_model": "",
+        }
+
+    @classmethod
+    def name(cls) -> str:
+        return "DB Chat"
+
+    @property
+    def output_chat_model(self) -> str:
+        return "chat_model"
+
+    @classmethod
+    def chat_profile(cls) -> cl.ChatProfile:
+        return cl.ChatProfile(
+            name=cls.name(),
+            markdown_description="DB VIEW",
+            icon="/public/favicon.png",
+            default=False,
+            starters=[
+                cl.Starter(
+                    label="Show Airflow status",
+                    message="Show Airflow status",
+                    # icon="https://cdn1.iconfinder.com/data/icons/photography-calendar-speaker-person-thinking-3d-il/128/13.png",
+                ),
+            ],
+        )
+
+    @property
+    def chat_settings(self) -> cl.ChatSettings:
+        return cl.ChatSettings(
+            [
+                Select(
+                    id="chat_model",
+                    label="Chat Model",
+                    values=sorted(
+                        llm_factory.list_models(capabilities=self.capabilities)
+                    ),
+                    initial_index=0,
+                ),
+            ]
+        )
