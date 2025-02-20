@@ -1,5 +1,18 @@
-# Installation
+# VEGA AI, Personal RAG and Linux SysAdmin management
 
+## Login
+![LOGIN](./pic/login.png)
+
+## Hello
+![Chat](./pic/first-chat.png)
+
+## Plot
+![Plot](./pic/plot.png)
+
+## RAG
+![RAG](./pic/rag.png)
+
+# Installation
 # Docker setup
 1. Make volume mount for Postgre and Minio, 
     `mkdir volume && cd volume && mkdir postgre minio`
