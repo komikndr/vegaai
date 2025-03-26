@@ -9,7 +9,7 @@ from sqlalchemy import create_engine
 import es
 
 ssl_args = {"use_ssl": True, "verify_certs": False, "ssl_show_warn": False}
-opensearch_engine = create_engine("odelasticsearch+https://admin:admin@10.10.5.11:9220/", connect_args=ssl_args)
+opensearch_engine = create_engine("odelasticsearch+https://admin:admin@locahost:9200/", connect_args=ssl_args)
 opensearch_db = SQLDatabase(opensearch_engine)
 
 
